@@ -21,9 +21,12 @@
 package org.apache.druid.query.expression;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.ObjectReader;
 import org.apache.druid.guice.annotations.Json;
+import org.apache.druid.java.util.common.StringUtils;
+import org.apache.druid.java.util.common.logger.Logger;
 import org.apache.druid.math.expr.Expr;
 import org.apache.druid.math.expr.ExprEval;
 import org.apache.druid.math.expr.ExprMacroTable;
@@ -42,6 +45,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 public class NestedDataExpressions
@@ -149,7 +153,7 @@ public class NestedDataExpressions
           }
 
           try {
-            obj = jsonMapper.readValue(getArgAsJson(arg), Object.class);
+            obj = jsonMapper.readValue(getArgAsJson(JsonMergeExprMacro.this, jsonMapper, arg), Object.class);
           }
           catch (JsonProcessingException e) {
             throw JsonMergeExprMacro.this.processingFailed(e, "bad string input [%s]", arg.asString());
@@ -161,7 +165,7 @@ public class NestedDataExpressions
             ExprEval argSub = args.get(i).eval(bindings);
             
             try {
-              String str = getArgAsJson(argSub);
+              String str = getArgAsJson(JsonMergeExprMacro.this, jsonMapper, argSub);
               if (str != null) {
                 obj = updater.readValue(str);
               }
@@ -181,35 +185,192 @@ public class NestedDataExpressions
           return ExpressionType.NESTED_DATA;
         }
 
-        private String getArgAsJson(ExprEval arg)
-        {
-          if (arg.value() == null) {
-            return null;
-          }
 
-          if (arg.type().is(ExprType.STRING)) {
-            return arg.asString();
-          } 
-          
-          if (arg.type().is(ExprType.COMPLEX)) {
-            try {
-              return jsonMapper.writeValueAsString(unwrap(arg));
-            }
-            catch (JsonProcessingException e) {
-              throw JsonMergeExprMacro.this.processingFailed(e, "bad complex input [%s]", arg.asString());
-            } 
-          } 
-          
-          throw JsonMergeExprMacro.this.validationFailed(
-            "invalid input expected %s but got %s instead",
-            ExpressionType.STRING,
-            arg.type()
-          );
-        }
       }
       return new ParseJsonExpr(args);
     }
   }
+
+  public static class JsonMergeAggrExprMacro implements ExprMacroTable.ExprMacro
+  {
+    public static final String NAME = "json_merge_aggr";
+    static final Logger logger = new Logger(NestedDataExpressions.class);
+
+    private final ObjectMapper jsonMapper;
+
+    @Inject
+    public JsonMergeAggrExprMacro(
+            @Json ObjectMapper jsonMapper
+    )
+    {
+      this.jsonMapper = jsonMapper;
+    }
+
+    public enum Aggregate
+    {
+      ADD,
+      MULTIPLY
+    }
+
+    interface Aggregator
+    {
+      ExprEval aggregate(ExprEval sourceValue, ExprEval targetValue);
+    }
+
+    public static class AddAggregator implements Aggregator
+    {
+      @Override
+      public ExprEval aggregate(ExprEval sourceValue, ExprEval targetValue)
+      {
+        if (sourceValue.type().isNumeric() && targetValue.type().isNumeric()) {
+          if (sourceValue.type().equals(ExpressionType.LONG) && targetValue.type().equals(ExpressionType.LONG)) {
+            return ExprEval.of(sourceValue.asLong() + targetValue.asLong());
+          }
+
+          return ExprEval.of(sourceValue.asDouble() + targetValue.asDouble());
+        }
+        return targetValue;
+      }
+    }
+
+    public static class MultiplyAggregator implements Aggregator
+    {
+      @Override
+      public ExprEval aggregate(ExprEval sourceValue, ExprEval targetValue)
+      {
+        if (sourceValue.type().isNumeric() && targetValue.type().isNumeric()) {
+          if (sourceValue.type().equals(ExpressionType.LONG) && targetValue.type().equals(ExpressionType.LONG)) {
+            return ExprEval.of(sourceValue.asLong() * targetValue.asLong());
+          }
+
+          return ExprEval.of(sourceValue.asDouble() * targetValue.asDouble());
+        }
+        return targetValue;
+      }
+    }
+
+    private Aggregator getAggregator(Aggregate aggregate)
+    {
+      switch (aggregate) {
+        case ADD:
+          return new AddAggregator();
+        case MULTIPLY:
+          return new MultiplyAggregator();
+        default:
+          throw new IllegalArgumentException("Unknown aggregator: " + aggregate);
+      }
+    }
+
+    private void mergeJson(Map<String, Object> source, Map<String, Object> target, Aggregator aggregator)
+    {
+      logger.info("SHIVAM - inside merge json");
+      for (String key : target.keySet()) {
+        if (source.containsKey(key)) {
+          logger.info("SHIVAM -  contain key - " + key);
+          if (source.get(key) instanceof Map && target.get(key) instanceof Map) {
+            mergeJson((Map<String, Object>) source.get(key), (Map<String, Object>) target.get(key), aggregator);
+          } else {
+            ExprEval sourceValue = ExprEval.bestEffortOf(source.get(key));
+            ExprEval targetValue = ExprEval.bestEffortOf(target.get(key));
+
+            ExprEval newValue = aggregator.aggregate(sourceValue, targetValue);
+            logger.info("SHIVAM - new Value type = " + newValue.type().asTypeString());
+            logger.info("SHIVAM - new Value = " + newValue.asString());
+            source.put(key, unwrap(newValue));
+          }
+        } else {
+          logger.info("SHIVAM - does not contain key - " + key);
+          source.put(key, target.get(key));
+        }
+      }
+    }
+
+    @Override
+    public Expr apply(List<Expr> args)
+    {
+      if (args.size() < 3) {
+        throw validationFailed("must have at least three arguments");
+      }
+
+      final class JsonMergeAggExpr extends ExprMacroTable.BaseScalarMacroFunctionExpr
+      {
+        public JsonMergeAggExpr(List<Expr> args)
+        {
+          super(JsonMergeAggrExprMacro.this, args);
+        }
+
+        @Override
+        public ExprEval eval(ObjectBinding bindings)
+        {
+          if (!args.get(0).isLiteral() || args.get(0).getLiteralValue() == null) {
+            throw validationFailed("aggregator arg must be literal");
+          }
+
+          final Aggregator aggregator = getAggregator(Aggregate.valueOf(
+                  StringUtils.toUpperCase((String) args.get(0).getLiteralValue())
+          ));
+
+          ExprEval arg = args.get(1).eval(bindings);
+
+          if (arg.value() == null) {
+            throw JsonMergeAggrExprMacro.this.validationFailed(
+                    "invalid input expected %s but got %s instead",
+                    ExpressionType.STRING,
+                    arg.type()
+            );
+          }
+
+          Map<String, Object> source;
+          try {
+            String str = getArgAsJson(JsonMergeAggrExprMacro.this, jsonMapper, arg);
+            source = jsonMapper.readValue(str, new TypeReference<Map<String, Object>>() {});
+          }
+          catch (JsonProcessingException e) {
+            throw JsonMergeAggrExprMacro.this.processingFailed(e,
+                "bad string input [%s]", arg.asString());
+          }
+
+          for (int i = 2; i < args.size(); i++) {
+            logger.info("SHIVAM - i - " + i);
+            ExprEval argSub = args.get(i).eval(bindings);
+
+            try {
+              String str = getArgAsJson(JsonMergeAggrExprMacro.this, jsonMapper, argSub);
+              if (str != null) {
+                Map<String, Object> target = jsonMapper.readValue(str,
+                    new TypeReference<Map<String, Object>>() {});
+                mergeJson(source, target, aggregator);
+              }
+            }
+            catch (JsonProcessingException e) {
+              throw JsonMergeAggrExprMacro.this.processingFailed(e, "bad string input [%s]", argSub.asString());
+            }
+          }
+          logger.info("SHIVAM - reached till source");
+          HashMap<String, Object> result = new HashMap<>(source);
+          logger.info("SHIVAM - reached till end");
+          return ExprEval.ofComplex(ExpressionType.NESTED_DATA, result);
+        }
+
+        @Nullable
+        @Override
+        public ExpressionType getOutputType(InputBindingInspector inspector)
+        {
+          return ExpressionType.NESTED_DATA;
+        }
+      }
+      return new JsonMergeAggExpr(args);
+    }
+
+    @Override
+    public String name()
+    {
+      return NAME;
+    }
+
+
+  }
+
 
   public static class ToJsonStringExprMacro implements ExprMacroTable.ExprMacro
   {
@@ -852,5 +1013,32 @@ public class NestedDataExpressions
         (String) arg.getLiteralValue()
     );
     return parts;
+  }
+
+
+  static String getArgAsJson(NamedFunction fn, ObjectMapper jsonMapper, ExprEval arg)
+  {
+    if (arg.value() == null) {
+      return null;
+    }
+
+    if (arg.type().is(ExprType.STRING)) {
+      return arg.asString();
+    }
+
+    if (arg.type().is(ExprType.COMPLEX)) {
+      try {
+        return jsonMapper.writeValueAsString(unwrap(arg));
+      }
+      catch (JsonProcessingException e) {
+        throw fn.processingFailed(e, "bad complex input [%s]", arg.asString());
+      }
+    }
+
+    throw fn.validationFailed(
+            "invalid input expected %s but got %s instead",
+            ExpressionType.STRING,
+            arg.type()
+    );
   }
 }
